@@ -1,0 +1,7 @@
+# MacOS
+.DS_Store
+
+# Editors
+.vscode/
+.vs/
+.idea/
