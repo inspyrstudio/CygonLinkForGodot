@@ -12,7 +12,7 @@ func build(tree: Dictionary, base_dir: String) -> Node3D:
 	_mesh_cache.clear()
 	var root: Node3D = Node3D.new()
 	root.name = "Root"
-	var materials: Dictionary = _collect_materials(tree)
+	var materials: Dictionary = _collect_materials(tree, base_dir)
 	for prim: Dictionary in tree.get("prims", []):
 		_build_prim(prim, root, root, materials, base_dir)
 	return root
@@ -23,30 +23,96 @@ func build(tree: Dictionary, base_dir: String) -> Node3D:
 # =============================================================================
 
 ## Read the tree and builds a StandardMaterial3D for every `def Material`.
-func _collect_materials(tree: Dictionary) -> Dictionary:
+func _collect_materials(tree: Dictionary, base_dir: String) -> Dictionary:
 	var out: Dictionary = {}
 	for prim: Dictionary in tree.get("prims", []):
-		_walk_materials(prim, "", out)
+		_walk_materials(prim, "", base_dir, out)
 	return out
 
-func _walk_materials(prim: Dictionary, parent_path: String, out: Dictionary) -> void:
+func _walk_materials(prim: Dictionary, parent_path: String, base_dir: String, out: Dictionary) -> void:
 	var path: String = "%s/%s" % [parent_path, prim.name]
 	if prim.type == "Material":
-		out[path] = _build_material(prim)
+		out[path] = _build_material(prim, base_dir)
 	
 	for child: Dictionary in prim.children:
-		_walk_materials(child, path, out)
+		_walk_materials(child, path, base_dir, out)
 
-func _build_material(prim: Dictionary) -> StandardMaterial3D:
+## Builds a StandardMaterial3D from a `def Material`. The diffuse input takes
+## one of two forms:
+##   * `inputs:diffuseColor = (r, g, b)`      -> flat albedo color
+##   * `inputs:diffuseColor.connect = <path>` -> follows to a UsdUVTexture
+##                                               shader and loads its PNG
+func _build_material(prim: Dictionary, base_dir: String) -> StandardMaterial3D:
 	var mat: StandardMaterial3D = StandardMaterial3D.new()
-	for child: Dictionary in prim.children:
-		if child.type != "Shader":
-			continue
+	var surface: Dictionary = _find_shader(prim, "UsdPreviewSurface")
+	if surface.is_empty():
+		return mat
 		
-		var diffuse: Variant = child.attrs.get("inputs:diffuseColor", null)
-		if diffuse is Array and diffuse.size() == 3:
-			mat.albedo_color = Color(diffuse[0], diffuse[1], diffuse[2])
+	var attrs: Dictionary = surface.attrs
+	var diffuse: Variant = attrs.get("inputs:diffuseColor", null)
+	if diffuse is Array and diffuse.size() == 3:
+		mat.albedo_color = Color(diffuse[0], diffuse[1], diffuse[2])
+	
+	var connect: Variant = attrs.get("inputs:diffuseColor.connect", null)
+	if connect is Dictionary and connect.has("_path"):
+		var tex_shader: Dictionary = _find_shader_by_name(prim, _prim_name_from_path(connect["_path"]))
+		var tex: Texture2D = _load_texture(tex_shader, base_dir)
+		if tex != null:
+			mat.albedo_texture = tex
+	
+	var metallic: Variant = attrs.get("inputs:metallic", null)
+	if metallic != null:
+		mat.metallic = float(metallic)
+	
 	return mat
+
+## Finds the first child Shader whose `info:id` matches [param info_id].
+func _find_shader(material_prim: Dictionary, info_id: String) -> Dictionary:
+	for child: Dictionary in material_prim.children:
+		if child.type == "Shader" and child.attrs.get("info:id", "") == info_id:
+			return child
+	return {}
+
+## Finds a child Shader by prim name.
+func _find_shader_by_name(material_prim: Dictionary, shader_name: String) -> Dictionary:
+	for child: Dictionary in material_prim.children:
+		if child.type == "Shader" and child.name == shader_name:
+			return child
+	return {}
+
+## Extracts the prim name from a connection path, dropping the output port.
+## `/World/Materials/X/diffuseTexture.outputs:rgb` -> `diffuseTexture`
+func _prim_name_from_path(path: String) -> String:
+	var segments: PackedStringArray = path.split("/")
+	var last: String = segments[segments.size() - 1]
+	return last.get_slice(".", 0)
+
+## Loads the PNG referenced by a UsdUVTexture shader's `inputs:file`.
+## Prefers Godot's imported texture (shared, mipmapped); falls back to a raw
+## image load so import order can't leave the texture missing.
+func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
+	if shader.is_empty():
+		return null
+		
+	var file_val: Variant = shader.attrs.get("inputs:file", null)
+	if not (file_val is Dictionary and file_val.has("_asset")):
+		return null
+	
+	var abs_path: String = "%s/%s" % [base_dir, file_val["_asset"]]
+	if ResourceLoader.exists(abs_path):
+		var res: Resource = load(abs_path)
+		if res is Texture2D:
+			return res
+	
+	if not FileAccess.file_exists(abs_path):
+		push_warning("CygonLink: missing texture %s" % abs_path)
+		return null
+	
+	var img: Image = Image.load_from_file(abs_path)
+	if img == null:
+		push_warning("CygonLink: cannot load texture %s" % abs_path)
+		return null
+	return ImageTexture.create_from_image(img)
 
 
 
