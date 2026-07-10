@@ -57,7 +57,10 @@ func _build_material(prim: Dictionary) -> StandardMaterial3D:
 func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials: Dictionary, base_dir: String) -> void:
 	if prim.name == "Materials":
 		return
-
+	
+	if prim.get("kind", "def") == "over":
+		return
+	
 	var node: Node3D = _instantiate_reference(prim, base_dir)
 	if node == null:
 		node = Node3D.new()
