@@ -37,11 +37,11 @@ func _walk_materials(prim: Dictionary, parent_path: String, base_dir: String, ou
 	for child: Dictionary in prim.children:
 		_walk_materials(child, path, base_dir, out)
 
-## Builds a StandardMaterial3D from a `def Material`. The diffuse input takes
-## one of two forms:
-##   * `inputs:diffuseColor = (r, g, b)`      -> flat albedo color
-##   * `inputs:diffuseColor.connect = <path>` -> follows to a UsdUVTexture
-##                                               shader and loads its PNG
+## Builds a StandardMaterial3D from a `def Material`. Reads the UsdPreviewSurface
+## shader and, for each input, either a flat value or a connected UsdUVTexture:
+##   * diffuseColor -> albedo_color / albedo_texture
+##   * normal       -> normal_texture
+##   * metallic / roughness -> scalar
 func _build_material(prim: Dictionary, base_dir: String) -> StandardMaterial3D:
 	var mat: StandardMaterial3D = StandardMaterial3D.new()
 	var surface: Dictionary = _find_shader(prim, "UsdPreviewSurface")
@@ -49,22 +49,60 @@ func _build_material(prim: Dictionary, base_dir: String) -> StandardMaterial3D:
 		return mat
 		
 	var attrs: Dictionary = surface.attrs
+	
 	var diffuse: Variant = attrs.get("inputs:diffuseColor", null)
 	if diffuse is Array and diffuse.size() == 3:
 		mat.albedo_color = Color(diffuse[0], diffuse[1], diffuse[2])
 	
-	var connect: Variant = attrs.get("inputs:diffuseColor.connect", null)
-	if connect is Dictionary and connect.has("_path"):
-		var tex_shader: Dictionary = _find_shader_by_name(prim, _prim_name_from_path(connect["_path"]))
-		var tex: Texture2D = _load_texture(tex_shader, base_dir)
+	var diffuse_shader: Dictionary = _connected_shader(prim, attrs, "inputs:diffuseColor")
+	if not diffuse_shader.is_empty():
+		var tex: Texture2D = _load_texture(diffuse_shader, base_dir)
 		if tex != null:
 			mat.albedo_texture = tex
+			_apply_texture_transform(mat, prim, diffuse_shader)
+	
+	var normal_shader: Dictionary = _connected_shader(prim, attrs, "inputs:normal")
+	if not normal_shader.is_empty():
+		var normal_tex: Texture2D = _load_texture(normal_shader, base_dir)
+		if normal_tex != null:
+			mat.normal_enabled = true
+			mat.normal_texture = normal_tex
 	
 	var metallic: Variant = attrs.get("inputs:metallic", null)
 	if metallic != null:
 		mat.metallic = float(metallic)
 	
+	var roughness: Variant = attrs.get("inputs:roughness", null)
+	if roughness != null:
+		mat.roughness = float(roughness)
+	
 	return mat
+
+## Applies texture wrap mode and the UV scale/offset from the connected
+## UsdTransform2d shader.
+func _apply_texture_transform(mat: StandardMaterial3D, material_prim: Dictionary, tex_shader: Dictionary) -> void:
+	if tex_shader.is_empty():
+		return
+	
+	# USD default wrap is "repeat"; only "clamp" needs action (repeat is Godot's default).
+	if tex_shader.attrs.get("inputs:wrapS", "repeat") == "clamp":
+		mat.texture_repeat = false
+	
+	var st_connect: Variant = tex_shader.attrs.get("inputs:st.connect", null)
+	if not (st_connect is Dictionary and st_connect.has("_path")):
+		return
+	
+	var xform: Dictionary = _find_shader_by_name(material_prim, _prim_name_from_path(st_connect["_path"]))
+	if xform.is_empty():
+		return
+	
+	var scale: Variant = xform.attrs.get("inputs:scale", null)
+	if scale is Array and scale.size() == 2:
+		mat.uv1_scale = Vector3(scale[0], scale[1], 1.0)
+	
+	var translation: Variant = xform.attrs.get("inputs:translation", null)
+	if translation is Array and translation.size() == 2:
+		mat.uv1_offset = Vector3(translation[0], translation[1], 0.0)
 
 ## Finds the first child Shader whose `info:id` matches [param info_id].
 func _find_shader(material_prim: Dictionary, info_id: String) -> Dictionary:
@@ -80,6 +118,14 @@ func _find_shader_by_name(material_prim: Dictionary, shader_name: String) -> Dic
 			return child
 	return {}
 
+## Returns the shader connected to `input_name` (e.g. "inputs:normal"), or {}
+## if that input is absent or not wired to a shader.
+func _connected_shader(material_prim: Dictionary, attrs: Dictionary, input_name: String) -> Dictionary:
+	var connect: Variant = attrs.get(input_name + ".connect", null)
+	if not (connect is Dictionary and connect.has("_path")):
+		return {}
+	return _find_shader_by_name(material_prim, _prim_name_from_path(connect["_path"]))
+
 ## Extracts the prim name from a connection path, dropping the output port.
 ## `/World/Materials/X/diffuseTexture.outputs:rgb` -> `diffuseTexture`
 func _prim_name_from_path(path: String) -> String:
@@ -88,22 +134,15 @@ func _prim_name_from_path(path: String) -> String:
 	return last.get_slice(".", 0)
 
 ## Loads the PNG referenced by a UsdUVTexture shader's `inputs:file`.
-## Prefers Godot's imported texture (shared, mipmapped); falls back to a raw
-## image load so import order can't leave the texture missing.
 func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 	if shader.is_empty():
 		return null
-		
+	
 	var file_val: Variant = shader.attrs.get("inputs:file", null)
 	if not (file_val is Dictionary and file_val.has("_asset")):
 		return null
 	
 	var abs_path: String = "%s/%s" % [base_dir, file_val["_asset"]]
-	if ResourceLoader.exists(abs_path):
-		var res: Resource = load(abs_path)
-		if res is Texture2D:
-			return res
-	
 	if not FileAccess.file_exists(abs_path):
 		push_warning("CygonLink: missing texture %s" % abs_path)
 		return null
@@ -112,6 +151,7 @@ func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 	if img == null:
 		push_warning("CygonLink: cannot load texture %s" % abs_path)
 		return null
+	img.generate_mipmaps()
 	return ImageTexture.create_from_image(img)
 
 
@@ -135,7 +175,12 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	_apply_transform(node, prim.attrs)
 	parent.add_child(node)
 	_claim_owner_recursive(node, owner_root)
-	_apply_material(node, prim.attrs, materials)
+	
+	var subset_bindings: Dictionary = _collect_subset_bindings(prim)
+	if subset_bindings.is_empty():
+		_apply_material(node, prim.attrs, materials)
+	else:
+		_apply_subset_materials(node, subset_bindings, materials)
 	
 	for child: Dictionary in prim.children:
 		_build_prim(child, node, owner_root, materials, base_dir)
@@ -206,6 +251,8 @@ func _vec3_from(value: Variant, fallback: Vector3) -> Vector3:
 		return Vector3(value[0], value[1], value[2])
 	return fallback
 
+## Applies a single `material:binding` attribute as a material_override,
+## covering every surface of the mesh.
 func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> void:
 	var binding: Variant = attrs.get("material:binding", null)
 	if not (binding is Dictionary and binding.has("_path")):
@@ -216,6 +263,38 @@ func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> 
 	var mi: MeshInstance3D = _find_mesh_instance(node)
 	if mi != null:
 		mi.material_override = mat
+
+## Collects per-subset material bindings from the prim's `over` blocks.
+func _collect_subset_bindings(prim: Dictionary) -> Dictionary:
+	var out: Dictionary = {}
+	for over_block: Dictionary in prim.get("children", []):
+		if over_block.get("kind", "def") != "over":
+			continue
+		for subset: Dictionary in over_block.get("children", []):
+			var binding: Variant = subset.attrs.get("material:binding", null)
+			if binding is Dictionary and binding.has("_path"):
+				out[subset.name] = binding["_path"]
+	return out
+
+## Applies per-subset materials as surface overrides, matching subset names to
+## the mesh's named surfaces (set by [UsdaMeshBuilder]).
+func _apply_subset_materials(node: Node3D, bindings: Dictionary, materials: Dictionary) -> void:
+	var mi: MeshInstance3D = _find_mesh_instance(node)
+	if mi == null or mi.mesh == null:
+		return
+	
+	var mesh: ArrayMesh = mi.mesh as ArrayMesh
+	if mesh == null:
+		return
+	
+	for i: int in mesh.get_surface_count():
+		var surface_name: String = mesh.surface_get_name(i)
+		if not bindings.has(surface_name):
+			continue
+		
+		var mat: Variant = materials.get(bindings[surface_name], null)
+		if mat != null:
+			mi.set_surface_override_material(i, mat)
 
 func _find_mesh_instance(node: Node) -> MeshInstance3D:
 	if node is MeshInstance3D:
