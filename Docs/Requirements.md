@@ -12,7 +12,7 @@ Before using Cygon Link, make sure the following requirements are met.
 ## No extra plugins required
 Unlike some USD workflows, Cygon Link does **not** depend on the OpenUSD library or any third-party addon. It is written entirely in GDScript and ships with its own `EditorImportPlugin`, so there is nothing else to install, compile, or enable.
 
-Materials are created as `StandardMaterial3D` and embedded directly in the imported scene, they work the same across the Forward+, Mobile, and Compatibility renderers, so there is no render-pipeline setup to worry about.
+Materials are created as `ShaderMaterial` (a small built-in spatial shader) and embedded directly in the imported scene, they work the same across the Forward+, Mobile, and Compatibility renderers, so there is no render-pipeline setup to worry about.
 
 ## Platform Support
 Because Cygon Link is pure GDScript with no native code, it runs anywhere the Godot editor runs:

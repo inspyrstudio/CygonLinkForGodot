@@ -5,7 +5,19 @@ class_name UsdaSceneBuilder
 ## Builds a Node3D scene tree from a parsed USDA scene. Caches referenced
 ## meshes per build — create a fresh instance for each import.
 
+## Shader file name, loaded relative to this script so the plugin keeps working
+## even if its folder is renamed or moved out of `addons/`.
+const _MATERIAL_SHADER_FILE: String = "cygon_material.gdshader"
+
 var _mesh_cache: Dictionary = {}
+var _material_shader: Shader = null
+
+## Lazily loads the shared material shader sitting next to this script.
+func _get_material_shader() -> Shader:
+	if _material_shader == null:
+		var dir: String = get_script().resource_path.get_base_dir()
+		_material_shader = load(dir.path_join(_MATERIAL_SHADER_FILE)) as Shader
+	return _material_shader
 
 ## Builds the scene root.
 func build(tree: Dictionary, base_dir: String) -> Node3D:
@@ -22,7 +34,7 @@ func build(tree: Dictionary, base_dir: String) -> Node3D:
 # MATERIALS
 # =============================================================================
 
-## Read the tree and builds a StandardMaterial3D for every `def Material`.
+## Read the tree and builds a ShaderMaterial for every `def Material`.
 func _collect_materials(tree: Dictionary, base_dir: String) -> Dictionary:
 	var out: Dictionary = {}
 	for prim: Dictionary in tree.get("prims", []):
@@ -37,13 +49,15 @@ func _walk_materials(prim: Dictionary, parent_path: String, base_dir: String, ou
 	for child: Dictionary in prim.children:
 		_walk_materials(child, path, base_dir, out)
 
-## Builds a StandardMaterial3D from a `def Material`. Reads the UsdPreviewSurface
+## Builds a ShaderMaterial from a `def Material`. Reads the UsdPreviewSurface
 ## shader and, for each input, either a flat value or a connected UsdUVTexture:
-##   * diffuseColor -> albedo_color / albedo_texture
-##   * normal       -> normal_texture
+##   * diffuseColor -> albedo_color / albedo_tex
+##   * normal       -> normal_tex
 ##   * metallic / roughness -> scalar
-func _build_material(prim: Dictionary, base_dir: String) -> StandardMaterial3D:
-	var mat: StandardMaterial3D = StandardMaterial3D.new()
+## UV scale/rotation/translation come from the connected UsdTransform2d.
+func _build_material(prim: Dictionary, base_dir: String) -> ShaderMaterial:
+	var mat: ShaderMaterial = ShaderMaterial.new()
+	mat.shader = _get_material_shader()
 	var surface: Dictionary = _find_shader(prim, "UsdPreviewSurface")
 	if surface.is_empty():
 		return mat
@@ -52,41 +66,38 @@ func _build_material(prim: Dictionary, base_dir: String) -> StandardMaterial3D:
 	
 	var diffuse: Variant = attrs.get("inputs:diffuseColor", null)
 	if diffuse is Array and diffuse.size() == 3:
-		mat.albedo_color = Color(diffuse[0], diffuse[1], diffuse[2])
+		mat.set_shader_parameter("albedo_color", Color(diffuse[0], diffuse[1], diffuse[2]))
 	
 	var diffuse_shader: Dictionary = _connected_shader(prim, attrs, "inputs:diffuseColor")
 	if not diffuse_shader.is_empty():
 		var tex: Texture2D = _load_texture(diffuse_shader, base_dir)
 		if tex != null:
-			mat.albedo_texture = tex
+			mat.set_shader_parameter("albedo_tex", tex)
+			mat.set_shader_parameter("use_albedo_tex", true)
 			_apply_texture_transform(mat, prim, diffuse_shader)
 	
 	var normal_shader: Dictionary = _connected_shader(prim, attrs, "inputs:normal")
 	if not normal_shader.is_empty():
 		var normal_tex: Texture2D = _load_texture(normal_shader, base_dir)
 		if normal_tex != null:
-			mat.normal_enabled = true
-			mat.normal_texture = normal_tex
+			mat.set_shader_parameter("normal_tex", normal_tex)
+			mat.set_shader_parameter("use_normal_tex", true)
 	
 	var metallic: Variant = attrs.get("inputs:metallic", null)
 	if metallic != null:
-		mat.metallic = float(metallic)
+		mat.set_shader_parameter("metallic_value", float(metallic))
 	
 	var roughness: Variant = attrs.get("inputs:roughness", null)
 	if roughness != null:
-		mat.roughness = float(roughness)
+		mat.set_shader_parameter("roughness_value", float(roughness))
 	
 	return mat
 
-## Applies texture wrap mode and the UV scale/offset from the connected
-## UsdTransform2d shader.
-func _apply_texture_transform(mat: StandardMaterial3D, material_prim: Dictionary, tex_shader: Dictionary) -> void:
+## Sets the UV scale/rotation/translation shader parameters from the connected
+## UsdTransform2d shader. Rotation is in degrees in USD, converted to radians.
+func _apply_texture_transform(mat: ShaderMaterial, material_prim: Dictionary, tex_shader: Dictionary) -> void:
 	if tex_shader.is_empty():
 		return
-	
-	# USD default wrap is "repeat"; only "clamp" needs action (repeat is Godot's default).
-	if tex_shader.attrs.get("inputs:wrapS", "repeat") == "clamp":
-		mat.texture_repeat = false
 	
 	var st_connect: Variant = tex_shader.attrs.get("inputs:st.connect", null)
 	if not (st_connect is Dictionary and st_connect.has("_path")):
@@ -98,11 +109,15 @@ func _apply_texture_transform(mat: StandardMaterial3D, material_prim: Dictionary
 	
 	var scale: Variant = xform.attrs.get("inputs:scale", null)
 	if scale is Array and scale.size() == 2:
-		mat.uv1_scale = Vector3(scale[0], scale[1], 1.0)
+		mat.set_shader_parameter("uv_scale", Vector2(scale[0], scale[1]))
 	
 	var translation: Variant = xform.attrs.get("inputs:translation", null)
 	if translation is Array and translation.size() == 2:
-		mat.uv1_offset = Vector3(translation[0], translation[1], 0.0)
+		mat.set_shader_parameter("uv_offset", Vector2(translation[0], translation[1]))
+	
+	var rotation: Variant = xform.attrs.get("inputs:rotation", null)
+	if rotation != null:
+		mat.set_shader_parameter("uv_rotation", deg_to_rad(float(rotation)))
 
 ## Finds the first child Shader whose `info:id` matches [param info_id].
 func _find_shader(material_prim: Dictionary, info_id: String) -> Dictionary:

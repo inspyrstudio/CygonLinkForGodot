@@ -6,7 +6,7 @@ Cygon Link is a Godot plugin that brings USDA (Universal Scene Description ASCII
 > New to Cygon? See [What is Cygon?](Docs/WhatIsCygon.md).
 
 ## Key Features
-📦 **Automated Asset Generation**: Converts USDA hierarchies, meshes, and materials directly into native Godot resources (`PackedScene`, `ArrayMesh`, `StandardMaterial3D`) with `StaticBody3D` + collision.
+📦 **Automated Asset Generation**: Converts USDA hierarchies, meshes, and materials directly into native Godot resources (`PackedScene`, `ArrayMesh`, `ShaderMaterial`) with `StaticBody3D` + collision.
 
 🔥 **Live Reimport**: Godot's import pipeline picks up changes to the source `.usda` file and reimports automatically, keep editing in Cygon, hit save, and the scene refreshes in Godot.
 

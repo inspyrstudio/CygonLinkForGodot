@@ -28,7 +28,7 @@ If you already have the exported files on disk, drag the `.usda` file **together
 ## Step 2 — Automatic Import
 - Cygon Link recognizes Cygon `.usda` files by their header (`#usda 1.0 | Cygon`) and imports them automatically through its `EditorImportPlugin`, no pop-up, no manual approval.
 - Each referenced mesh becomes a `StaticBody3D` containing a `MeshInstance3D` and a `CollisionShape3D` (a trimesh collider), and the scene hierarchy and transforms are reconstructed.
-- Materials are built as `StandardMaterial3D` (albedo, normal map, metallic/roughness, and UV tiling) and embedded in the scene. For multi-material meshes, one surface + material is created per USD `GeomSubset`.
+- Materials are built as `ShaderMaterial` (albedo, normal map, metallic/roughness, and UV scale/rotation/tiling) and embedded in the scene. For multi-material meshes, one surface + material is created per USD `GeomSubset`.
 
 > Textures (`.png`) are standard Godot imports. If they were just added, Godot may import them a moment before the scene — a reimport of the `.usda` will pick them up.
 
