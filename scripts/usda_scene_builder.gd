@@ -5,14 +5,26 @@ class_name UsdaSceneBuilder
 ## Builds a Node3D scene tree from a parsed USDA scene. Caches referenced
 ## meshes per build — create a fresh instance for each import.
 
+## Shader file name, loaded relative to this script so the plugin keeps working
+## even if its folder is renamed or moved out of `addons/`.
+const _MATERIAL_SHADER_FILE: String = "cygon_material.gdshader"
+
 var _mesh_cache: Dictionary = {}
+var _material_shader: Shader = null
+
+## Lazily loads the shared material shader sitting next to this script.
+func _get_material_shader() -> Shader:
+	if _material_shader == null:
+		var dir: String = get_script().resource_path.get_base_dir()
+		_material_shader = load(dir.path_join(_MATERIAL_SHADER_FILE)) as Shader
+	return _material_shader
 
 ## Builds the scene root.
 func build(tree: Dictionary, base_dir: String) -> Node3D:
 	_mesh_cache.clear()
 	var root: Node3D = Node3D.new()
 	root.name = "Root"
-	var materials: Dictionary = _collect_materials(tree)
+	var materials: Dictionary = _collect_materials(tree, base_dir)
 	for prim: Dictionary in tree.get("prims", []):
 		_build_prim(prim, root, root, materials, base_dir)
 	return root
@@ -22,31 +34,140 @@ func build(tree: Dictionary, base_dir: String) -> Node3D:
 # MATERIALS
 # =============================================================================
 
-## Read the tree and builds a StandardMaterial3D for every `def Material`.
-func _collect_materials(tree: Dictionary) -> Dictionary:
+## Read the tree and builds a ShaderMaterial for every `def Material`.
+func _collect_materials(tree: Dictionary, base_dir: String) -> Dictionary:
 	var out: Dictionary = {}
 	for prim: Dictionary in tree.get("prims", []):
-		_walk_materials(prim, "", out)
+		_walk_materials(prim, "", base_dir, out)
 	return out
 
-func _walk_materials(prim: Dictionary, parent_path: String, out: Dictionary) -> void:
+func _walk_materials(prim: Dictionary, parent_path: String, base_dir: String, out: Dictionary) -> void:
 	var path: String = "%s/%s" % [parent_path, prim.name]
 	if prim.type == "Material":
-		out[path] = _build_material(prim)
+		out[path] = _build_material(prim, base_dir)
 	
 	for child: Dictionary in prim.children:
-		_walk_materials(child, path, out)
+		_walk_materials(child, path, base_dir, out)
 
-func _build_material(prim: Dictionary) -> StandardMaterial3D:
-	var mat: StandardMaterial3D = StandardMaterial3D.new()
-	for child: Dictionary in prim.children:
-		if child.type != "Shader":
-			continue
+## Builds a ShaderMaterial from a `def Material`. Reads the UsdPreviewSurface
+## shader and, for each input, either a flat value or a connected UsdUVTexture:
+##   * diffuseColor -> albedo_color / albedo_tex
+##   * normal       -> normal_tex
+##   * metallic / roughness -> scalar
+## UV scale/rotation/translation come from the connected UsdTransform2d.
+func _build_material(prim: Dictionary, base_dir: String) -> ShaderMaterial:
+	var mat: ShaderMaterial = ShaderMaterial.new()
+	mat.shader = _get_material_shader()
+	var surface: Dictionary = _find_shader(prim, "UsdPreviewSurface")
+	if surface.is_empty():
+		return mat
 		
-		var diffuse: Variant = child.attrs.get("inputs:diffuseColor", null)
-		if diffuse is Array and diffuse.size() == 3:
-			mat.albedo_color = Color(diffuse[0], diffuse[1], diffuse[2])
+	var attrs: Dictionary = surface.attrs
+	
+	var diffuse: Variant = attrs.get("inputs:diffuseColor", null)
+	if diffuse is Array and diffuse.size() == 3:
+		mat.set_shader_parameter("albedo_color", Color(diffuse[0], diffuse[1], diffuse[2]))
+	
+	var diffuse_shader: Dictionary = _connected_shader(prim, attrs, "inputs:diffuseColor")
+	if not diffuse_shader.is_empty():
+		var tex: Texture2D = _load_texture(diffuse_shader, base_dir)
+		if tex != null:
+			mat.set_shader_parameter("albedo_tex", tex)
+			mat.set_shader_parameter("use_albedo_tex", true)
+			_apply_texture_transform(mat, prim, diffuse_shader)
+	
+	var normal_shader: Dictionary = _connected_shader(prim, attrs, "inputs:normal")
+	if not normal_shader.is_empty():
+		var normal_tex: Texture2D = _load_texture(normal_shader, base_dir)
+		if normal_tex != null:
+			mat.set_shader_parameter("normal_tex", normal_tex)
+			mat.set_shader_parameter("use_normal_tex", true)
+	
+	var metallic: Variant = attrs.get("inputs:metallic", null)
+	if metallic != null:
+		mat.set_shader_parameter("metallic_value", float(metallic))
+	
+	var roughness: Variant = attrs.get("inputs:roughness", null)
+	if roughness != null:
+		mat.set_shader_parameter("roughness_value", float(roughness))
+	
 	return mat
+
+## Sets the UV scale/rotation/translation shader parameters from the connected
+## UsdTransform2d shader. Rotation is in degrees in USD, converted to radians.
+func _apply_texture_transform(mat: ShaderMaterial, material_prim: Dictionary, tex_shader: Dictionary) -> void:
+	if tex_shader.is_empty():
+		return
+	
+	var st_connect: Variant = tex_shader.attrs.get("inputs:st.connect", null)
+	if not (st_connect is Dictionary and st_connect.has("_path")):
+		return
+	
+	var xform: Dictionary = _find_shader_by_name(material_prim, _prim_name_from_path(st_connect["_path"]))
+	if xform.is_empty():
+		return
+	
+	var scale: Variant = xform.attrs.get("inputs:scale", null)
+	if scale is Array and scale.size() == 2:
+		mat.set_shader_parameter("uv_scale", Vector2(scale[0], scale[1]))
+	
+	var translation: Variant = xform.attrs.get("inputs:translation", null)
+	if translation is Array and translation.size() == 2:
+		mat.set_shader_parameter("uv_offset", Vector2(translation[0], translation[1]))
+	
+	var rotation: Variant = xform.attrs.get("inputs:rotation", null)
+	if rotation != null:
+		mat.set_shader_parameter("uv_rotation", deg_to_rad(float(rotation)))
+
+## Finds the first child Shader whose `info:id` matches [param info_id].
+func _find_shader(material_prim: Dictionary, info_id: String) -> Dictionary:
+	for child: Dictionary in material_prim.children:
+		if child.type == "Shader" and child.attrs.get("info:id", "") == info_id:
+			return child
+	return {}
+
+## Finds a child Shader by prim name.
+func _find_shader_by_name(material_prim: Dictionary, shader_name: String) -> Dictionary:
+	for child: Dictionary in material_prim.children:
+		if child.type == "Shader" and child.name == shader_name:
+			return child
+	return {}
+
+## Returns the shader connected to `input_name` (e.g. "inputs:normal"), or {}
+## if that input is absent or not wired to a shader.
+func _connected_shader(material_prim: Dictionary, attrs: Dictionary, input_name: String) -> Dictionary:
+	var connect: Variant = attrs.get(input_name + ".connect", null)
+	if not (connect is Dictionary and connect.has("_path")):
+		return {}
+	return _find_shader_by_name(material_prim, _prim_name_from_path(connect["_path"]))
+
+## Extracts the prim name from a connection path, dropping the output port.
+## `/World/Materials/X/diffuseTexture.outputs:rgb` -> `diffuseTexture`
+func _prim_name_from_path(path: String) -> String:
+	var segments: PackedStringArray = path.split("/")
+	var last: String = segments[segments.size() - 1]
+	return last.get_slice(".", 0)
+
+## Loads the PNG referenced by a UsdUVTexture shader's `inputs:file`.
+func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
+	if shader.is_empty():
+		return null
+	
+	var file_val: Variant = shader.attrs.get("inputs:file", null)
+	if not (file_val is Dictionary and file_val.has("_asset")):
+		return null
+	
+	var abs_path: String = "%s/%s" % [base_dir, file_val["_asset"]]
+	if not FileAccess.file_exists(abs_path):
+		push_warning("CygonLink: missing texture %s" % abs_path)
+		return null
+	
+	var img: Image = Image.load_from_file(abs_path)
+	if img == null:
+		push_warning("CygonLink: cannot load texture %s" % abs_path)
+		return null
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
 
 
 
@@ -57,7 +178,10 @@ func _build_material(prim: Dictionary) -> StandardMaterial3D:
 func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials: Dictionary, base_dir: String) -> void:
 	if prim.name == "Materials":
 		return
-
+	
+	if prim.get("kind", "def") == "over":
+		return
+	
 	var node: Node3D = _instantiate_reference(prim, base_dir)
 	if node == null:
 		node = Node3D.new()
@@ -66,7 +190,12 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	_apply_transform(node, prim.attrs)
 	parent.add_child(node)
 	_claim_owner_recursive(node, owner_root)
-	_apply_material(node, prim.attrs, materials)
+	
+	var subset_bindings: Dictionary = _collect_subset_bindings(prim)
+	if subset_bindings.is_empty():
+		_apply_material(node, prim.attrs, materials)
+	else:
+		_apply_subset_materials(node, subset_bindings, materials)
 	
 	for child: Dictionary in prim.children:
 		_build_prim(child, node, owner_root, materials, base_dir)
@@ -137,6 +266,8 @@ func _vec3_from(value: Variant, fallback: Vector3) -> Vector3:
 		return Vector3(value[0], value[1], value[2])
 	return fallback
 
+## Applies a single `material:binding` attribute as a material_override,
+## covering every surface of the mesh.
 func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> void:
 	var binding: Variant = attrs.get("material:binding", null)
 	if not (binding is Dictionary and binding.has("_path")):
@@ -147,6 +278,38 @@ func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> 
 	var mi: MeshInstance3D = _find_mesh_instance(node)
 	if mi != null:
 		mi.material_override = mat
+
+## Collects per-subset material bindings from the prim's `over` blocks.
+func _collect_subset_bindings(prim: Dictionary) -> Dictionary:
+	var out: Dictionary = {}
+	for over_block: Dictionary in prim.get("children", []):
+		if over_block.get("kind", "def") != "over":
+			continue
+		for subset: Dictionary in over_block.get("children", []):
+			var binding: Variant = subset.attrs.get("material:binding", null)
+			if binding is Dictionary and binding.has("_path"):
+				out[subset.name] = binding["_path"]
+	return out
+
+## Applies per-subset materials as surface overrides, matching subset names to
+## the mesh's named surfaces (set by [UsdaMeshBuilder]).
+func _apply_subset_materials(node: Node3D, bindings: Dictionary, materials: Dictionary) -> void:
+	var mi: MeshInstance3D = _find_mesh_instance(node)
+	if mi == null or mi.mesh == null:
+		return
+	
+	var mesh: ArrayMesh = mi.mesh as ArrayMesh
+	if mesh == null:
+		return
+	
+	for i: int in mesh.get_surface_count():
+		var surface_name: String = mesh.surface_get_name(i)
+		if not bindings.has(surface_name):
+			continue
+		
+		var mat: Variant = materials.get(bindings[surface_name], null)
+		if mat != null:
+			mi.set_surface_override_material(i, mat)
 
 func _find_mesh_instance(node: Node) -> MeshInstance3D:
 	if node is MeshInstance3D:

@@ -28,7 +28,7 @@ static func classify(tree: Dictionary) -> Kind:
 	return Kind.SCENE
 
 static func _has_mesh(prim: Dictionary) -> bool:
-	if prim.get("type", "") == "Mesh":
+	if prim.get("kind", "def") == "def" and prim.get("type", "") == "Mesh":
 		return true
 	
 	for child: Dictionary in prim.get("children", []):
@@ -95,11 +95,12 @@ func _parse_prim() -> Dictionary:
 	
 	var state: Dictionary = _lexer.save_state()
 	var keyword: String = _lexer.read_ident()
-	if keyword != "def":
+	if keyword != "def" and keyword != "over":
 		_lexer.restore_state(state)
 		return {}
-
+	
 	var prim: Dictionary = {
+		"kind": keyword,  # "def" or "over"
 		"type": "",
 		"name": "",
 		"metadata": {},
