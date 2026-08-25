@@ -182,7 +182,7 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	if prim.get("kind", "def") == "over":
 		return
 	
-	var node: Node3D = _instantiate_reference(prim, base_dir)
+	var node: Node3D = _build_geometry_node(prim, base_dir)
 	if node == null:
 		node = Node3D.new()
 		
@@ -198,19 +198,41 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 		_apply_subset_materials(node, subset_bindings, materials)
 	
 	for child: Dictionary in prim.children:
+		if child.get("type", "") == "Mesh":
+			continue
 		_build_prim(child, node, owner_root, materials, base_dir)
 
-## Parses the prim's referenced file inline and returns a StaticBody3D wrapping the mesh + collider. null if there's no reference or the load fails.
-func _instantiate_reference(prim: Dictionary, base_dir: String) -> Node3D:
+## Builds a StaticBody3D wrapping the prim's geometry + collider, from either
+## an inline `def Mesh` child (current format) or a `prepend references` asset
+## (legacy, one file per mesh). null if the prim has no geometry.
+func _build_geometry_node(prim: Dictionary, base_dir: String) -> Node3D:
+	var mesh: ArrayMesh = null
+	var local: Transform3D = Transform3D.IDENTITY
+	var inline_mesh: Dictionary = _inline_mesh_child(prim)
+	if not inline_mesh.is_empty():
+		mesh = UsdaMeshBuilder.build(inline_mesh)
+		local = _transform_from(inline_mesh.attrs)
+	else:
+		mesh = _referenced_mesh(prim, base_dir)
+
+	if mesh == null:
+		return null
+	return UsdaMeshBuilder.build_static_body(mesh, "Body", local)
+
+## Returns the prim's direct `def Mesh` child, or {} if it has none.
+func _inline_mesh_child(prim: Dictionary) -> Dictionary:
+	for child: Dictionary in prim.get("children", []):
+		if child.get("type", "") == "Mesh":
+			return child
+	return {}
+
+## Loads the mesh from the prim's `prepend references` asset, or null if the
+## prim has no reference.
+func _referenced_mesh(prim: Dictionary, base_dir: String) -> ArrayMesh:
 	var ref: Variant = prim.metadata.get("prepend references", null)
 	if not (ref is Dictionary and ref.has("_asset")):
 		return null
-	
-	var abs_path: String = "%s/%s" % [base_dir, ref["_asset"]]
-	var mesh: ArrayMesh = _load_referenced_mesh(abs_path)
-	if mesh == null:
-		return null
-	return UsdaMeshBuilder.build_static_body(mesh, "Body")
+	return _load_referenced_mesh("%s/%s" % [base_dir, ref["_asset"]])
 
 ## Sets owner_root as owner of node and all descendants missing one — so the StaticBody3D's children save into the packed scene.
 func _claim_owner_recursive(node: Node, owner_root: Node) -> void:
@@ -253,13 +275,38 @@ func _load_referenced_mesh(abs_path: String) -> ArrayMesh:
 # TRANSFORM & MATERIAL APPLICATION
 # =============================================================================
 
-## Builds T * R * S from `xformOp:translate / rotateZYX / scale`. Rotation in degrees.
+## Euler rotation ops, mapped to the Godot rotation order that reproduces them.
+## The letters are reversed on purpose. USD names the op after the order its
+## rotations are *applied* in (`rotateZXY` = Z first, then X, then Y), while
+## Godot's EULER_ORDER_ZXY *composes* the matrix Z*X*Y, which applies Y first.
+## Reversing the name gives the matching composition order.
+const _ROTATION_OPS: Dictionary = {
+	"xformOp:rotateXYZ": EULER_ORDER_ZYX,
+	"xformOp:rotateXZY": EULER_ORDER_YZX,
+	"xformOp:rotateYXZ": EULER_ORDER_ZXY,
+	"xformOp:rotateYZX": EULER_ORDER_XZY,
+	"xformOp:rotateZXY": EULER_ORDER_YXZ,
+	"xformOp:rotateZYX": EULER_ORDER_XYZ,
+}
+
 func _apply_transform(node: Node3D, attrs: Dictionary) -> void:
+	node.transform = _transform_from(attrs)
+
+## Builds T * R * S from `xformOp:translate / rotate<Order> / scale`.
+func _transform_from(attrs: Dictionary) -> Transform3D:
 	var t: Vector3 = _vec3_from(attrs.get("xformOp:translate", null), Vector3.ZERO)
-	var r_deg: Vector3 = _vec3_from(attrs.get("xformOp:rotateZYX", null), Vector3.ZERO)
 	var s: Vector3 = _vec3_from(attrs.get("xformOp:scale", null), Vector3.ONE)
-	var basis: Basis = Basis.from_euler(Vector3(deg_to_rad(r_deg.x), deg_to_rad(r_deg.y), deg_to_rad(r_deg.z)), EULER_ORDER_ZYX).scaled(s)
-	node.transform = Transform3D(basis, t)
+	
+	var r_deg: Vector3 = Vector3.ZERO
+	var order: int = EULER_ORDER_XYZ
+	for op: String in _ROTATION_OPS:
+		if attrs.has(op):
+			r_deg = _vec3_from(attrs[op], Vector3.ZERO)
+			order = _ROTATION_OPS[op]
+			break
+	
+	var euler: Vector3 = Vector3(deg_to_rad(r_deg.x), deg_to_rad(r_deg.y), deg_to_rad(r_deg.z))
+	return Transform3D(Basis.from_euler(euler, order).scaled(s), t)
 
 func _vec3_from(value: Variant, fallback: Vector3) -> Vector3:
 	if value is Array and value.size() == 3:
@@ -279,17 +326,26 @@ func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> 
 	if mi != null:
 		mi.material_override = mat
 
-## Collects per-subset material bindings from the prim's `over` blocks.
+## Collects per-subset material bindings, keyed by subset name.
 func _collect_subset_bindings(prim: Dictionary) -> Dictionary:
 	var out: Dictionary = {}
+	
+	var inline_mesh: Dictionary = _inline_mesh_child(prim)
+	if not inline_mesh.is_empty():
+		_read_subset_bindings(inline_mesh, out)
+	
 	for over_block: Dictionary in prim.get("children", []):
-		if over_block.get("kind", "def") != "over":
-			continue
-		for subset: Dictionary in over_block.get("children", []):
-			var binding: Variant = subset.attrs.get("material:binding", null)
-			if binding is Dictionary and binding.has("_path"):
-				out[subset.name] = binding["_path"]
+		if over_block.get("kind", "def") == "over":
+			_read_subset_bindings(over_block, out)
 	return out
+
+## Reads `material:binding` off every child of [param container] that declares
+## one, into [param out] keyed by child name.
+func _read_subset_bindings(container: Dictionary, out: Dictionary) -> void:
+	for subset: Dictionary in container.get("children", []):
+		var binding: Variant = subset.attrs.get("material:binding", null)
+		if binding is Dictionary and binding.has("_path"):
+			out[subset.name] = binding["_path"]
 
 ## Applies per-subset materials as surface overrides, matching subset names to
 ## the mesh's named surfaces (set by [UsdaMeshBuilder]).

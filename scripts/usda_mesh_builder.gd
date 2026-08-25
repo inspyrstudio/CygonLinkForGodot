@@ -153,7 +153,10 @@ static func _interpolation_of(attrs: Dictionary, attr_name: String) -> String:
 	return ""
 
 ## Wraps a mesh in a StaticBody3D with a MeshInstance3D and a CollisionShape3D child.
-static func build_static_body(mesh: ArrayMesh, body_name: String) -> StaticBody3D:
+## [param local_transform] is the mesh prim's own transform — Cygon uses it to
+## carry an off-center pivot. It goes on the geometry children rather than the
+## body so the body's origin stays the prim's pivot.
+static func build_static_body(mesh: ArrayMesh, body_name: String, local_transform: Transform3D = Transform3D.IDENTITY,) -> StaticBody3D:
 	if mesh == null:
 		return null
 	var body: StaticBody3D = StaticBody3D.new()
@@ -161,11 +164,13 @@ static func build_static_body(mesh: ArrayMesh, body_name: String) -> StaticBody3
 
 	var mi: MeshInstance3D = MeshInstance3D.new()
 	mi.name = "MeshInstance"
+	mi.transform = local_transform
 	mi.mesh = mesh
 	body.add_child(mi)
 
 	var cs: CollisionShape3D = CollisionShape3D.new()
 	cs.name = "CollisionShape"
+	cs.transform = local_transform
 	cs.shape = mesh.create_trimesh_shape()
 	body.add_child(cs)
 

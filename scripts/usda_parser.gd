@@ -20,12 +20,33 @@ var _lexer: UsdaLexer = UsdaLexer.new()
 func is_cygon_file(source: String) -> bool:
 	return source.get_slice("\n", 0).strip_edges() == MARKER
 
-## Returns MESH if the tree contains a `def Mesh` at any depth, else SCENE.
+## Tells a standalone mesh file apart from a scene file.
+## Scene markers are checked first: a current-format scene holds its meshes
+## inline, so looking for a `def Mesh` alone would misread it as a mesh file.
 static func classify(tree: Dictionary) -> Kind:
+	for prim: Dictionary in tree.get("prims", []):
+		if _has_scene_markers(prim):
+			return Kind.SCENE
+	
 	for prim: Dictionary in tree.get("prims", []):
 		if _has_mesh(prim):
 			return Kind.MESH
 	return Kind.SCENE
+
+## True if the prim or any descendant shows something only a scene file has:
+## a material, a `kind` classification, or an external mesh reference.
+static func _has_scene_markers(prim: Dictionary) -> bool:
+	if prim.get("type", "") == "Material":
+		return true
+	
+	var metadata: Dictionary = prim.get("metadata", {})
+	if metadata.has("kind") or metadata.has("prepend references"):
+		return true
+	
+	for child: Dictionary in prim.get("children", []):
+		if _has_scene_markers(child):
+			return true
+	return false
 
 static func _has_mesh(prim: Dictionary) -> bool:
 	if prim.get("kind", "def") == "def" and prim.get("type", "") == "Mesh":
