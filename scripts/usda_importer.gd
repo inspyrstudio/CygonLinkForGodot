@@ -39,13 +39,22 @@ func _get_import_options(_path: String, _preset_index: int) -> Array[Dictionary]
 func _get_option_visibility(_path: String, _option_name: StringName, _options: Dictionary) -> bool:
 	return true
 
+
+var _last_key: String = ""
+var _last_scene: PackedScene = null
+
 func _import(source_file: String, save_path: String, _options: Dictionary, _platform_variants: Array[String], _gen_files: Array[String]) -> Error:
 	var file: FileAccess = FileAccess.open(source_file, FileAccess.READ)
 	if file == null:
 		push_error("CygonLink: cannot open %s" % source_file)
 		return ERR_CANT_OPEN
 	var source: String = file.get_as_text()
-
+	
+	var out_path: String = "%s.%s" % [save_path, _get_save_extension()]
+	var key: String = "%s:%d:%d" % [source_file, source.length(), source.hash()]
+	if key == _last_key and _last_scene != null:
+		return ResourceSaver.save(_last_scene, out_path)
+	
 	var parser: UsdaParser = UsdaParser.new()
 	if not parser.is_cygon_file(source):
 		push_error("CygonLink: %s is not a Cygon USDA file (read %d bytes)" % [source_file, source.length()])
@@ -65,7 +74,10 @@ func _import(source_file: String, save_path: String, _options: Dictionary, _plat
 	var pack_err: int = packed.pack(root)
 	if pack_err != OK:
 		return pack_err
-	return ResourceSaver.save(packed, "%s.%s" % [save_path, _get_save_extension()])
+	
+	_last_key = key
+	_last_scene = packed
+	return ResourceSaver.save(packed, out_path)
 
 
 ## Dispatches on file kind. Both kinds return a Node3D root packable as a PackedScene.
