@@ -22,7 +22,10 @@ func _get_priority() -> float:
 	return 1.0
 
 func _get_import_order() -> int:
-	return 0
+	return 100
+
+func _can_import_threaded() -> bool:
+	return false
 
 func _get_preset_count() -> int:
 	return 0
@@ -45,7 +48,7 @@ func _import(source_file: String, save_path: String, _options: Dictionary, _plat
 
 	var parser: UsdaParser = UsdaParser.new()
 	if not parser.is_cygon_file(source):
-		push_warning("CygonLink: %s is not a Cygon USDA file, skipping" % source_file)
+		push_error("CygonLink: %s is not a Cygon USDA file (read %d bytes)" % [source_file, source.length()])
 		return ERR_FILE_UNRECOGNIZED
 
 	var tree: Dictionary = parser.parse(source)
