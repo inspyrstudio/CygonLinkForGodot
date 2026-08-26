@@ -148,7 +148,9 @@ func _prim_name_from_path(path: String) -> String:
 	var last: String = segments[segments.size() - 1]
 	return last.get_slice(".", 0)
 
-## Loads the PNG referenced by a UsdUVTexture shader's `inputs:file`.
+## Loads the texture referenced by a UsdUVTexture shader's `inputs:file`.
+## References Godot's imported texture instead of reading the PNG into an
+## ImageTexture. Referencing the import also shares one texture between materials and keeps VRAM compression.
 func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 	if shader.is_empty():
 		return null
@@ -162,12 +164,16 @@ func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 		push_warning("CygonLink: missing texture %s" % abs_path)
 		return null
 	
-	var img: Image = Image.load_from_file(abs_path)
-	if img == null:
-		push_warning("CygonLink: cannot load texture %s" % abs_path)
+	if not ResourceLoader.exists(abs_path):
+		push_warning("CygonLink: texture not imported yet, reimport to apply: %s" % abs_path)
 		return null
-	img.generate_mipmaps()
-	return ImageTexture.create_from_image(img)
+	
+	var res: Resource = load(abs_path)
+	if res is Texture2D:
+		return res
+	
+	push_warning("CygonLink: %s did not import as a texture" % abs_path)
+	return null
 
 
 
