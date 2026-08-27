@@ -12,6 +12,8 @@ const _MATERIAL_SHADER_FILE: String = "cygon_material.gdshader"
 var _mesh_cache: Dictionary = {}
 var _material_shader: Shader = null
 
+var _prototypes: Dictionary = {}
+
 ## Lazily loads the shared material shader sitting next to this script.
 func _get_material_shader() -> Shader:
 	if _material_shader == null:
@@ -22,12 +24,26 @@ func _get_material_shader() -> Shader:
 ## Builds the scene root.
 func build(tree: Dictionary, base_dir: String) -> Node3D:
 	_mesh_cache.clear()
+	_prototypes.clear()
+	for prim: Dictionary in tree.get("prims", []):
+		_index_prims(prim, "")
+	
 	var root: Node3D = Node3D.new()
 	root.name = "Root"
 	var materials: Dictionary = _collect_materials(tree, base_dir)
 	for prim: Dictionary in tree.get("prims", []):
 		_build_prim(prim, root, root, materials, base_dir)
 	return root
+
+## Records every prim by USD path, which is what reference targets are written
+## against. Done in one pass up front because a reference can point at a
+## prototype declared later in the file than the prim using it.
+func _index_prims(prim: Dictionary, parent_path: String) -> void:
+	var path: String = "%s/%s" % [parent_path, prim.name]
+	_prototypes[path] = prim
+	for child: Dictionary in prim.get("children", []):
+		_index_prims(child, path)
+
 
 
 # =============================================================================
@@ -185,10 +201,12 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	if prim.name == "Materials":
 		return
 	
-	if prim.get("kind", "def") == "over":
+	var kind: String = prim.get("kind", "def")
+	if kind == "over" or kind == "class":
 		return
 	
-	var node: Node3D = _build_geometry_node(prim, base_dir)
+	var mesh_prim: Dictionary = _resolve_mesh_prim(prim)
+	var node: Node3D = _build_geometry_node(prim, mesh_prim, base_dir)
 	if node == null:
 		node = Node3D.new()
 		
@@ -197,33 +215,55 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	parent.add_child(node)
 	_claim_owner_recursive(node, owner_root)
 	
-	var subset_bindings: Dictionary = _collect_subset_bindings(prim)
+	for child: Dictionary in prim.children:
+		if child.get("type", "") == "Mesh":
+			continue
+		_build_prim(child, node, owner_root, materials, base_dir)
+	
+	var subset_bindings: Dictionary = _collect_subset_bindings(prim, mesh_prim)
 	if subset_bindings.is_empty():
 		_apply_material(node, prim.attrs, materials)
 	else:
 		_apply_subset_materials(node, subset_bindings, materials)
 	
-	for child: Dictionary in prim.children:
-		if child.get("type", "") == "Mesh":
-			continue
-		_build_prim(child, node, owner_root, materials, base_dir)
-
-## Builds a StaticBody3D wrapping the prim's geometry + collider, from either
-## an inline `def Mesh` child (current format) or a `prepend references` asset
-## (legacy, one file per mesh). null if the prim has no geometry.
-func _build_geometry_node(prim: Dictionary, base_dir: String) -> Node3D:
-	var mesh: ArrayMesh = null
-	var local: Transform3D = Transform3D.IDENTITY
+## Finds the Mesh prim supplying this prim's geometry, either inline as a child
+## or through a `prepend references` path into the `class` prototypes. Returns {}
+## for a prim with no geometry of its own.
+func _resolve_mesh_prim(prim: Dictionary) -> Dictionary:
 	var inline_mesh: Dictionary = _inline_mesh_child(prim)
 	if not inline_mesh.is_empty():
-		mesh = UsdaMeshBuilder.build(inline_mesh)
-		local = _transform_from(inline_mesh.attrs)
-	else:
-		mesh = _referenced_mesh(prim, base_dir)
+		return inline_mesh
 
-	if mesh == null:
+	var proto_path: String = _reference_path(prim)
+	if proto_path.is_empty():
+		return {}
+
+	var prototype: Variant = _prototypes.get(proto_path, null)
+	if prototype == null:
+		push_warning("CygonLink: unresolved reference %s" % proto_path)
+		return {}
+	return UsdaMeshBuilder.find_first_mesh(prototype)
+
+## Builds a StaticBody3D wrapping the prim's geometry + collider.
+func _build_geometry_node(prim: Dictionary, mesh_prim: Dictionary, base_dir: String) -> Node3D:
+	if not mesh_prim.is_empty():
+		# Prototypes are shared by many instances, so build each one once.
+		var cache_key: String = _reference_path(prim)
+		var mesh: ArrayMesh = null
+		if not cache_key.is_empty() and _mesh_cache.has(cache_key):
+			mesh = _mesh_cache[cache_key]
+		else:
+			mesh = UsdaMeshBuilder.build(mesh_prim)
+			if not cache_key.is_empty():
+				_mesh_cache[cache_key] = mesh
+		if mesh == null:
+			return null
+		return UsdaMeshBuilder.build_static_body(mesh, "Body", _transform_from(mesh_prim.attrs))
+	
+	var file_mesh: ArrayMesh = _referenced_mesh(prim, base_dir)
+	if file_mesh == null:
 		return null
-	return UsdaMeshBuilder.build_static_body(mesh, "Body", local)
+	return UsdaMeshBuilder.build_static_body(file_mesh, "Body")
 
 ## Returns the prim's direct `def Mesh` child, or {} if it has none.
 func _inline_mesh_child(prim: Dictionary) -> Dictionary:
@@ -231,6 +271,14 @@ func _inline_mesh_child(prim: Dictionary) -> Dictionary:
 		if child.get("type", "") == "Mesh":
 			return child
 	return {}
+
+## Prim path a `prepend references` points at, or "" when the reference is
+## absent or names an external file rather than a path in this scene.
+func _reference_path(prim: Dictionary) -> String:
+	var ref: Variant = prim.get("metadata", {}).get("prepend references", null)
+	if ref is Dictionary and ref.has("_path"):
+		return ref["_path"]
+	return ""
 
 ## Loads the mesh from the prim's `prepend references` asset, or null if the
 ## prim has no reference.
@@ -332,13 +380,14 @@ func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> 
 	if mi != null:
 		mi.material_override = mat
 
-## Collects per-subset material bindings, keyed by subset name.
-func _collect_subset_bindings(prim: Dictionary) -> Dictionary:
+## Collects per-subset material bindings, keyed by subset name. Bindings live
+## either on the GeomSubsets of the mesh itself (whether inline or reached
+## through a prototype) or, in legacy files, on an `over` block mirroring it.
+func _collect_subset_bindings(prim: Dictionary, mesh_prim: Dictionary) -> Dictionary:
 	var out: Dictionary = {}
 	
-	var inline_mesh: Dictionary = _inline_mesh_child(prim)
-	if not inline_mesh.is_empty():
-		_read_subset_bindings(inline_mesh, out)
+	if not mesh_prim.is_empty():
+		_read_subset_bindings(mesh_prim, out)
 	
 	for over_block: Dictionary in prim.get("children", []):
 		if over_block.get("kind", "def") == "over":

@@ -115,12 +115,12 @@ func _parse_prim() -> Dictionary:
 	
 	var state: Dictionary = _lexer.save_state()
 	var keyword: String = _lexer.read_ident()
-	if keyword != "def" and keyword != "over":
+	if keyword != "def" and keyword != "over" and keyword != "class":
 		_lexer.restore_state(state)
 		return {}
 	
 	var prim: Dictionary = {
-		"kind": keyword,  # "def" or "over"
+		"kind": keyword,  # "def", "over" or "class"
 		"type": "",
 		"name": "",
 		"metadata": {},
