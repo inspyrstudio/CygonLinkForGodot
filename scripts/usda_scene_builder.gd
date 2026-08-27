@@ -346,7 +346,7 @@ const _ROTATION_OPS: Dictionary = {
 func _apply_transform(node: Node3D, attrs: Dictionary) -> void:
 	node.transform = _transform_from(attrs)
 
-## Builds T * R * S from `xformOp:translate / rotate<Order> / scale`.
+## Builds T * R * S from `xformOp:translate / rotate<Order> / scale`
 func _transform_from(attrs: Dictionary) -> Transform3D:
 	var t: Vector3 = _vec3_from(attrs.get("xformOp:translate", null), Vector3.ZERO)
 	var s: Vector3 = _vec3_from(attrs.get("xformOp:scale", null), Vector3.ONE)
@@ -360,7 +360,8 @@ func _transform_from(attrs: Dictionary) -> Transform3D:
 			break
 	
 	var euler: Vector3 = Vector3(deg_to_rad(r_deg.x), deg_to_rad(r_deg.y), deg_to_rad(r_deg.z))
-	return Transform3D(Basis.from_euler(euler, order).scaled(s), t)
+	var basis: Basis = Basis.from_euler(euler, order) * Basis.from_scale(s)
+	return Transform3D(basis, t)
 
 func _vec3_from(value: Variant, fallback: Vector3) -> Vector3:
 	if value is Array and value.size() == 3:
