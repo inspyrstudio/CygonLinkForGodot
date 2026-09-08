@@ -12,6 +12,8 @@ const _MATERIAL_SHADER_FILE: String = "cygon_material.gdshader"
 var _mesh_cache: Dictionary = {}
 var _material_shader: Shader = null
 
+var _prototypes: Dictionary = {}
+
 ## Lazily loads the shared material shader sitting next to this script.
 func _get_material_shader() -> Shader:
 	if _material_shader == null:
@@ -22,12 +24,26 @@ func _get_material_shader() -> Shader:
 ## Builds the scene root.
 func build(tree: Dictionary, base_dir: String) -> Node3D:
 	_mesh_cache.clear()
+	_prototypes.clear()
+	for prim: Dictionary in tree.get("prims", []):
+		_index_prims(prim, "")
+	
 	var root: Node3D = Node3D.new()
 	root.name = "Root"
 	var materials: Dictionary = _collect_materials(tree, base_dir)
 	for prim: Dictionary in tree.get("prims", []):
 		_build_prim(prim, root, root, materials, base_dir)
 	return root
+
+## Records every prim by USD path, which is what reference targets are written
+## against. Done in one pass up front because a reference can point at a
+## prototype declared later in the file than the prim using it.
+func _index_prims(prim: Dictionary, parent_path: String) -> void:
+	var path: String = "%s/%s" % [parent_path, prim.name]
+	_prototypes[path] = prim
+	for child: Dictionary in prim.get("children", []):
+		_index_prims(child, path)
+
 
 
 # =============================================================================
@@ -148,7 +164,9 @@ func _prim_name_from_path(path: String) -> String:
 	var last: String = segments[segments.size() - 1]
 	return last.get_slice(".", 0)
 
-## Loads the PNG referenced by a UsdUVTexture shader's `inputs:file`.
+## Loads the texture referenced by a UsdUVTexture shader's `inputs:file`.
+## References Godot's imported texture instead of reading the PNG into an
+## ImageTexture. Referencing the import also shares one texture between materials and keeps VRAM compression.
 func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 	if shader.is_empty():
 		return null
@@ -162,12 +180,16 @@ func _load_texture(shader: Dictionary, base_dir: String) -> Texture2D:
 		push_warning("CygonLink: missing texture %s" % abs_path)
 		return null
 	
-	var img: Image = Image.load_from_file(abs_path)
-	if img == null:
-		push_warning("CygonLink: cannot load texture %s" % abs_path)
+	if not ResourceLoader.exists(abs_path):
+		push_warning("CygonLink: texture not imported yet, reimport to apply: %s" % abs_path)
 		return null
-	img.generate_mipmaps()
-	return ImageTexture.create_from_image(img)
+	
+	var res: Resource = load(abs_path)
+	if res is Texture2D:
+		return res
+	
+	push_warning("CygonLink: %s did not import as a texture" % abs_path)
+	return null
 
 
 
@@ -179,10 +201,12 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	if prim.name == "Materials":
 		return
 	
-	if prim.get("kind", "def") == "over":
+	var kind: String = prim.get("kind", "def")
+	if kind == "over" or kind == "class":
 		return
 	
-	var node: Node3D = _instantiate_reference(prim, base_dir)
+	var mesh_prim: Dictionary = _resolve_mesh_prim(prim)
+	var node: Node3D = _build_geometry_node(prim, mesh_prim, base_dir)
 	if node == null:
 		node = Node3D.new()
 		
@@ -191,26 +215,78 @@ func _build_prim(prim: Dictionary, parent: Node3D, owner_root: Node3D, materials
 	parent.add_child(node)
 	_claim_owner_recursive(node, owner_root)
 	
-	var subset_bindings: Dictionary = _collect_subset_bindings(prim)
+	for child: Dictionary in prim.children:
+		if child.get("type", "") == "Mesh":
+			continue
+		_build_prim(child, node, owner_root, materials, base_dir)
+	
+	var subset_bindings: Dictionary = _collect_subset_bindings(prim, mesh_prim)
 	if subset_bindings.is_empty():
 		_apply_material(node, prim.attrs, materials)
 	else:
 		_apply_subset_materials(node, subset_bindings, materials)
 	
-	for child: Dictionary in prim.children:
-		_build_prim(child, node, owner_root, materials, base_dir)
+## Finds the Mesh prim supplying this prim's geometry, either inline as a child
+## or through a `prepend references` path into the `class` prototypes. Returns {}
+## for a prim with no geometry of its own.
+func _resolve_mesh_prim(prim: Dictionary) -> Dictionary:
+	var inline_mesh: Dictionary = _inline_mesh_child(prim)
+	if not inline_mesh.is_empty():
+		return inline_mesh
 
-## Parses the prim's referenced file inline and returns a StaticBody3D wrapping the mesh + collider. null if there's no reference or the load fails.
-func _instantiate_reference(prim: Dictionary, base_dir: String) -> Node3D:
+	var proto_path: String = _reference_path(prim)
+	if proto_path.is_empty():
+		return {}
+
+	var prototype: Variant = _prototypes.get(proto_path, null)
+	if prototype == null:
+		push_warning("CygonLink: unresolved reference %s" % proto_path)
+		return {}
+	return UsdaMeshBuilder.find_first_mesh(prototype)
+
+## Builds a StaticBody3D wrapping the prim's geometry + collider.
+func _build_geometry_node(prim: Dictionary, mesh_prim: Dictionary, base_dir: String) -> Node3D:
+	if not mesh_prim.is_empty():
+		# Prototypes are shared by many instances, so build each one once.
+		var cache_key: String = _reference_path(prim)
+		var mesh: ArrayMesh = null
+		if not cache_key.is_empty() and _mesh_cache.has(cache_key):
+			mesh = _mesh_cache[cache_key]
+		else:
+			mesh = UsdaMeshBuilder.build(mesh_prim)
+			if not cache_key.is_empty():
+				_mesh_cache[cache_key] = mesh
+		if mesh == null:
+			return null
+		return UsdaMeshBuilder.build_static_body(mesh, "Body", _transform_from(mesh_prim.attrs))
+	
+	var file_mesh: ArrayMesh = _referenced_mesh(prim, base_dir)
+	if file_mesh == null:
+		return null
+	return UsdaMeshBuilder.build_static_body(file_mesh, "Body")
+
+## Returns the prim's direct `def Mesh` child, or {} if it has none.
+func _inline_mesh_child(prim: Dictionary) -> Dictionary:
+	for child: Dictionary in prim.get("children", []):
+		if child.get("type", "") == "Mesh":
+			return child
+	return {}
+
+## Prim path a `prepend references` points at, or "" when the reference is
+## absent or names an external file rather than a path in this scene.
+func _reference_path(prim: Dictionary) -> String:
+	var ref: Variant = prim.get("metadata", {}).get("prepend references", null)
+	if ref is Dictionary and ref.has("_path"):
+		return ref["_path"]
+	return ""
+
+## Loads the mesh from the prim's `prepend references` asset, or null if the
+## prim has no reference.
+func _referenced_mesh(prim: Dictionary, base_dir: String) -> ArrayMesh:
 	var ref: Variant = prim.metadata.get("prepend references", null)
 	if not (ref is Dictionary and ref.has("_asset")):
 		return null
-	
-	var abs_path: String = "%s/%s" % [base_dir, ref["_asset"]]
-	var mesh: ArrayMesh = _load_referenced_mesh(abs_path)
-	if mesh == null:
-		return null
-	return UsdaMeshBuilder.build_static_body(mesh, "Body")
+	return _load_referenced_mesh("%s/%s" % [base_dir, ref["_asset"]])
 
 ## Sets owner_root as owner of node and all descendants missing one — so the StaticBody3D's children save into the packed scene.
 func _claim_owner_recursive(node: Node, owner_root: Node) -> void:
@@ -253,13 +329,39 @@ func _load_referenced_mesh(abs_path: String) -> ArrayMesh:
 # TRANSFORM & MATERIAL APPLICATION
 # =============================================================================
 
-## Builds T * R * S from `xformOp:translate / rotateZYX / scale`. Rotation in degrees.
+## Euler rotation ops, mapped to the Godot rotation order that reproduces them.
+## The letters are reversed on purpose. USD names the op after the order its
+## rotations are *applied* in (`rotateZXY` = Z first, then X, then Y), while
+## Godot's EULER_ORDER_ZXY *composes* the matrix Z*X*Y, which applies Y first.
+## Reversing the name gives the matching composition order.
+const _ROTATION_OPS: Dictionary = {
+	"xformOp:rotateXYZ": EULER_ORDER_ZYX,
+	"xformOp:rotateXZY": EULER_ORDER_YZX,
+	"xformOp:rotateYXZ": EULER_ORDER_ZXY,
+	"xformOp:rotateYZX": EULER_ORDER_XZY,
+	"xformOp:rotateZXY": EULER_ORDER_YXZ,
+	"xformOp:rotateZYX": EULER_ORDER_XYZ,
+}
+
 func _apply_transform(node: Node3D, attrs: Dictionary) -> void:
+	node.transform = _transform_from(attrs)
+
+## Builds T * R * S from `xformOp:translate / rotate<Order> / scale`
+func _transform_from(attrs: Dictionary) -> Transform3D:
 	var t: Vector3 = _vec3_from(attrs.get("xformOp:translate", null), Vector3.ZERO)
-	var r_deg: Vector3 = _vec3_from(attrs.get("xformOp:rotateZYX", null), Vector3.ZERO)
 	var s: Vector3 = _vec3_from(attrs.get("xformOp:scale", null), Vector3.ONE)
-	var basis: Basis = Basis.from_euler(Vector3(deg_to_rad(r_deg.x), deg_to_rad(r_deg.y), deg_to_rad(r_deg.z)), EULER_ORDER_ZYX).scaled(s)
-	node.transform = Transform3D(basis, t)
+	
+	var r_deg: Vector3 = Vector3.ZERO
+	var order: int = EULER_ORDER_XYZ
+	for op: String in _ROTATION_OPS:
+		if attrs.has(op):
+			r_deg = _vec3_from(attrs[op], Vector3.ZERO)
+			order = _ROTATION_OPS[op]
+			break
+	
+	var euler: Vector3 = Vector3(deg_to_rad(r_deg.x), deg_to_rad(r_deg.y), deg_to_rad(r_deg.z))
+	var basis: Basis = Basis.from_euler(euler, order) * Basis.from_scale(s)
+	return Transform3D(basis, t)
 
 func _vec3_from(value: Variant, fallback: Vector3) -> Vector3:
 	if value is Array and value.size() == 3:
@@ -279,17 +381,27 @@ func _apply_material(node: Node3D, attrs: Dictionary, materials: Dictionary) -> 
 	if mi != null:
 		mi.material_override = mat
 
-## Collects per-subset material bindings from the prim's `over` blocks.
-func _collect_subset_bindings(prim: Dictionary) -> Dictionary:
+## Collects per-subset material bindings, keyed by subset name. Bindings live
+## either on the GeomSubsets of the mesh itself (whether inline or reached
+## through a prototype) or, in legacy files, on an `over` block mirroring it.
+func _collect_subset_bindings(prim: Dictionary, mesh_prim: Dictionary) -> Dictionary:
 	var out: Dictionary = {}
+	
+	if not mesh_prim.is_empty():
+		_read_subset_bindings(mesh_prim, out)
+	
 	for over_block: Dictionary in prim.get("children", []):
-		if over_block.get("kind", "def") != "over":
-			continue
-		for subset: Dictionary in over_block.get("children", []):
-			var binding: Variant = subset.attrs.get("material:binding", null)
-			if binding is Dictionary and binding.has("_path"):
-				out[subset.name] = binding["_path"]
+		if over_block.get("kind", "def") == "over":
+			_read_subset_bindings(over_block, out)
 	return out
+
+## Reads `material:binding` off every child of [param container] that declares
+## one, into [param out] keyed by child name.
+func _read_subset_bindings(container: Dictionary, out: Dictionary) -> void:
+	for subset: Dictionary in container.get("children", []):
+		var binding: Variant = subset.attrs.get("material:binding", null)
+		if binding is Dictionary and binding.has("_path"):
+			out[subset.name] = binding["_path"]
 
 ## Applies per-subset materials as surface overrides, matching subset names to
 ## the mesh's named surfaces (set by [UsdaMeshBuilder]).

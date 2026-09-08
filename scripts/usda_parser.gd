@@ -20,12 +20,33 @@ var _lexer: UsdaLexer = UsdaLexer.new()
 func is_cygon_file(source: String) -> bool:
 	return source.get_slice("\n", 0).strip_edges() == MARKER
 
-## Returns MESH if the tree contains a `def Mesh` at any depth, else SCENE.
+## Tells a standalone mesh file apart from a scene file.
+## Scene markers are checked first: a current-format scene holds its meshes
+## inline, so looking for a `def Mesh` alone would misread it as a mesh file.
 static func classify(tree: Dictionary) -> Kind:
+	for prim: Dictionary in tree.get("prims", []):
+		if _has_scene_markers(prim):
+			return Kind.SCENE
+	
 	for prim: Dictionary in tree.get("prims", []):
 		if _has_mesh(prim):
 			return Kind.MESH
 	return Kind.SCENE
+
+## True if the prim or any descendant shows something only a scene file has:
+## a material, a `kind` classification, or an external mesh reference.
+static func _has_scene_markers(prim: Dictionary) -> bool:
+	if prim.get("type", "") == "Material":
+		return true
+	
+	var metadata: Dictionary = prim.get("metadata", {})
+	if metadata.has("kind") or metadata.has("prepend references"):
+		return true
+	
+	for child: Dictionary in prim.get("children", []):
+		if _has_scene_markers(child):
+			return true
+	return false
 
 static func _has_mesh(prim: Dictionary) -> bool:
 	if prim.get("kind", "def") == "def" and prim.get("type", "") == "Mesh":
@@ -82,8 +103,7 @@ func _read_qualified_key() -> String:
 	_lexer.skip_whitespace()
 	var first: String = _lexer.read_ident()
 	
-	var next_ch: String = _lexer.peek()
-	if not next_ch.is_empty() and (next_ch.is_valid_identifier() or next_ch == "_"):
+	if UsdaLexer.is_ident_start(_lexer.peek_code()):
 		var second: String = _lexer.read_ident()
 		return "%s %s" % [first, second]
 	return first
@@ -95,12 +115,12 @@ func _parse_prim() -> Dictionary:
 	
 	var state: Dictionary = _lexer.save_state()
 	var keyword: String = _lexer.read_ident()
-	if keyword != "def" and keyword != "over":
+	if keyword != "def" and keyword != "over" and keyword != "class":
 		_lexer.restore_state(state)
 		return {}
 	
 	var prim: Dictionary = {
-		"kind": keyword,  # "def" or "over"
+		"kind": keyword,  # "def", "over" or "class"
 		"type": "",
 		"name": "",
 		"metadata": {},
@@ -141,48 +161,48 @@ func _parse_prim() -> Dictionary:
 	return prim
 
 func _parse_attribute(out: Dictionary) -> void:
-	var idents: Array[String] = []
-	while true:
-		var ch: String = _lexer.peek()
-		if ch.is_empty():
-			break
-		if not (ch.is_valid_identifier() or ch == "_"):
-			break
-		idents.append(_lexer.read_ident())
+	var name: String = ""
+	while UsdaLexer.is_ident_start(_lexer.peek_code()):
+		name = _lexer.read_ident()
 	
-	if idents.is_empty():
+	if name.is_empty():
 		error = "Expected attribute name at line %d" % _lexer.current_line()
 		return
 	
-	var name: String = idents[idents.size() - 1]
 	if _lexer.try_consume("="):
 		out[name] = _parse_value()
 	else:
 		out[name] = null
 	
-	if _lexer.peek() == "(":
+	if _lexer.peek_code() == 0x28:  # (
 		out[name + ".meta"] = _parse_paren_block()
 
+## Dispatches on the next character's code rather than on a one-character
+## string: this runs once per value, so on a mesh's coordinate arrays it is the
+## hottest path in the parser.
 func _parse_value() -> Variant:
-	var ch: String = _lexer.peek()
-	if ch.is_empty():
+	var code: int = _lexer.peek_code()
+	if code == -1:
 		error = "Unexpected EOF in value at line %d" % _lexer.current_line()
 		return null
-	if ch == "\"":
-		return _lexer.read_string()
-	if ch == "@":
-		return {"_asset": _lexer.read_asset()}
-	if ch == "<":
-		return {"_path": _lexer.read_path()}
-	if ch == "(":
-		return _parse_tuple()
-	if ch == "[":
-		return _parse_array()
-	if ch.is_valid_int() or ch == "-" or ch == "+" or ch == ".":
+	
+	# Numbers first — array elements outnumber every other value by far.
+	if UsdaLexer.is_number_start(code):
 		return _lexer.read_number()
-	if ch.is_valid_identifier() or ch == "_":
+	if code == 0x28:  # (
+		return _parse_tuple()
+	if code == 0x5B:  # [
+		return _parse_array()
+	if code == 0x22:  # "
+		return _lexer.read_string()
+	if code == 0x40:  # @
+		return {"_asset": _lexer.read_asset()}
+	if code == 0x3C:  # <
+		return {"_path": _lexer.read_path()}
+	if UsdaLexer.is_ident_start(code):
 		return _lexer.read_ident()
-	error = "Unexpected char '%s' in value at line %d" % [ch, _lexer.current_line()]
+	
+	error = "Unexpected char '%s' in value at line %d" % [char(code), _lexer.current_line()]
 	return null
 
 func _parse_tuple() -> Array:

@@ -65,8 +65,10 @@ static func _build_surface(geo: Dictionary, faces: Array) -> Array:
 	var verts: PackedVector3Array = PackedVector3Array()
 	var normals: PackedVector3Array = PackedVector3Array()
 	var uvs: PackedVector2Array = PackedVector2Array()
+	var tangents: PackedFloat32Array = PackedFloat32Array()
 	var has_normals: bool = not geo.normals.is_empty()
 	var has_uvs: bool = not geo.uvs.is_empty()
+	var want_tangents: bool = has_normals and has_uvs
 	
 	for face: int in faces:
 		var count: int = geo.counts[face]
@@ -74,21 +76,45 @@ static func _build_surface(geo: Dictionary, faces: Array) -> Array:
 		for tri: int in range(1, count - 1):
 			var corners: Array = [0, tri, tri + 1]
 			_orient_triangle(geo, corner_base, corners, has_normals)
-			for k: int in corners:
-				var corner: int = corner_base + k
-				var vertex_index: int = geo.indices[corner]
-				var p: Array = geo.points[vertex_index]
-				verts.append(Vector3(p[0], p[1], p[2]))
+			
+			var c0: int = corner_base + corners[0]
+			var c1: int = corner_base + corners[1]
+			var c2: int = corner_base + corners[2]
+			
+			var p0: Vector3 = _point_at(geo, c0)
+			var p1: Vector3 = _point_at(geo, c1)
+			var p2: Vector3 = _point_at(geo, c2)
+			verts.append(p0)
+			verts.append(p1)
+			verts.append(p2)
+			
+			var n0: Vector3 = Vector3.UP
+			var n1: Vector3 = Vector3.UP
+			var n2: Vector3 = Vector3.UP
+			if has_normals:
+				n0 = _normal_at(geo, c0)
+				n1 = _normal_at(geo, c1)
+				n2 = _normal_at(geo, c2)
+				normals.append(n0)
+				normals.append(n1)
+				normals.append(n2)
 				
-				if has_normals:
-					var n_idx: int = corner if geo.normals_fv else vertex_index
-					var n: Array = geo.normals[n_idx]
-					normals.append(Vector3(n[0], n[1], n[2]))
-				
-				if has_uvs:
-					var uv_idx: int = corner if geo.uvs_fv else vertex_index
-					var uv: Array = geo.uvs[uv_idx]
-					uvs.append(Vector2(uv[0], 1.0 - uv[1]))
+			var uv0: Vector2 = Vector2.ZERO
+			var uv1: Vector2 = Vector2.ZERO
+			var uv2: Vector2 = Vector2.ZERO
+			if has_uvs:
+				uv0 = _uv_at(geo, c0)
+				uv1 = _uv_at(geo, c1)
+				uv2 = _uv_at(geo, c2)
+				uvs.append(uv0)
+				uvs.append(uv1)
+				uvs.append(uv2)
+			
+			if want_tangents:
+				var basis: Array = _triangle_tangent(p0, p1, p2, uv0, uv1, uv2)
+				_append_tangent(tangents, n0, basis[0], basis[1])
+				_append_tangent(tangents, n1, basis[0], basis[1])
+				_append_tangent(tangents, n2, basis[0], basis[1])
 	
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
@@ -99,7 +125,49 @@ static func _build_surface(geo: Dictionary, faces: Array) -> Array:
 		
 	if uvs.size() == verts.size():
 		arrays[Mesh.ARRAY_TEX_UV] = uvs
+	
+	if tangents.size() == verts.size() * 4:
+		arrays[Mesh.ARRAY_TANGENT] = tangents
 	return arrays
+
+## UV of a corner, with V flipped to Godot's top-left origin. Tangents are
+## derived from these same values, so both stay consistent.
+static func _uv_at(geo: Dictionary, corner: int) -> Vector2:
+	var idx: int = corner if geo.uvs_fv else geo.indices[corner]
+	var uv: Array = geo.uvs[idx]
+	return Vector2(uv[0], 1.0 - uv[1])
+
+## Tangent and bitangent of a triangle, from how its UVs vary across it.
+## Returns [tangent, bitangent], both unnormalized.
+static func _triangle_tangent(p0: Vector3, p1: Vector3, p2: Vector3, uv0: Vector2, uv1: Vector2, uv2: Vector2) -> Array:
+	var e1: Vector3 = p1 - p0
+	var e2: Vector3 = p2 - p0
+	var d1: Vector2 = uv1 - uv0
+	var d2: Vector2 = uv2 - uv0
+	
+	var det: float = d1.x * d2.y - d2.x * d1.y
+	if absf(det) < 1e-12:
+		return [e1, e2]
+	
+	var r: float = 1.0 / det
+	return [(e1 * d2.y - e2 * d1.y) * r, (e2 * d1.x - e1 * d2.x) * r]
+
+## Writes one tangent, made perpendicular to [param normal], plus the binormal
+## sign Godot uses to rebuild the third axis.
+static func _append_tangent(
+	out: PackedFloat32Array, normal: Vector3, tangent: Vector3, bitangent: Vector3
+) -> void:
+	var t: Vector3 = tangent - normal * normal.dot(tangent)
+	if t.length_squared() < 1e-16:
+		t = normal.cross(Vector3.UP)
+		if t.length_squared() < 1e-16:
+			t = normal.cross(Vector3.RIGHT)
+	t = t.normalized()
+	
+	out.append(t.x)
+	out.append(t.y)
+	out.append(t.z)
+	out.append(-1.0 if normal.cross(t).dot(bitangent) < 0.0 else 1.0)
 
 ## Reorders a triangle's corners in place so its geometric winding faces the
 ## same direction as its provided normal.
@@ -153,7 +221,10 @@ static func _interpolation_of(attrs: Dictionary, attr_name: String) -> String:
 	return ""
 
 ## Wraps a mesh in a StaticBody3D with a MeshInstance3D and a CollisionShape3D child.
-static func build_static_body(mesh: ArrayMesh, body_name: String) -> StaticBody3D:
+## [param local_transform] is the mesh prim's own transform — Cygon uses it to
+## carry an off-center pivot. It goes on the geometry children rather than the
+## body so the body's origin stays the prim's pivot.
+static func build_static_body(mesh: ArrayMesh, body_name: String, local_transform: Transform3D = Transform3D.IDENTITY,) -> StaticBody3D:
 	if mesh == null:
 		return null
 	var body: StaticBody3D = StaticBody3D.new()
@@ -161,11 +232,13 @@ static func build_static_body(mesh: ArrayMesh, body_name: String) -> StaticBody3
 
 	var mi: MeshInstance3D = MeshInstance3D.new()
 	mi.name = "MeshInstance"
+	mi.transform = local_transform
 	mi.mesh = mesh
 	body.add_child(mi)
 
 	var cs: CollisionShape3D = CollisionShape3D.new()
 	cs.name = "CollisionShape"
+	cs.transform = local_transform
 	cs.shape = mesh.create_trimesh_shape()
 	body.add_child(cs)
 
